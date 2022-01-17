@@ -25,6 +25,7 @@ import shutil
 import colorsys
 import argparse
 import numpy as np
+import pickle
 from tqdm import tqdm
 from multi_person_tracker import MPT
 from torch.utils.data import DataLoader
@@ -49,6 +50,15 @@ from lib.utils.demo_utils import (
 
 MIN_NUM_FRAMES = 25
 
+def load_bbox(bbox_path):
+    with open(bbox_path, "rb") as f:
+        bbox = pickle.load(f)
+    for i in range(len(bbox)):
+        frame = bbox[i]
+        max_conf_idx = np.argmax([instance['bbox'][4] for instance in frame])
+        bbox[i] = frame[max_conf_idx]['bbox']
+    bbox = np.array(bbox)[:, :4]
+    return bbox
 
 def main(args):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -85,16 +95,22 @@ def main(args):
             video_file = os.path.join(os.getcwd(), video_file)
         tracking_results = run_posetracker(video_file, staf_folder=args.staf_dir, display=args.display)
     else:
-        # run multi object tracker
-        mot = MPT(
-            device=device,
-            batch_size=args.tracker_batch_size,
-            display=args.display,
-            detector_type=args.detector,
-            output_format='dict',
-            yolo_img_size=args.yolo_img_size,
-        )
-        tracking_results = mot(image_folder)
+        if args.bbox_path:
+            bbox = load_bbox(args.bbox_path)
+            tracking_results = {1: {}}
+            tracking_results[1]['bbox'] = bbox
+            tracking_results[1]['frames'] = np.arange(bbox.shape[0])
+        else:
+            # run multi object tracker
+            mot = MPT(
+                device=device,
+                batch_size=args.tracker_batch_size,
+                display=args.display,
+                detector_type=args.detector,
+                output_format='dict',
+                yolo_img_size=args.yolo_img_size,
+            )
+            tracking_results = mot(image_folder)
 
     # remove tracklets if num_frames is less than MIN_NUM_FRAMES
     for person_id in list(tracking_results.keys()):
@@ -160,15 +176,22 @@ def main(args):
                 batch = batch.to(device)
 
                 batch_size, seqlen = batch.shape[:2]
-                output = model(batch)[-1]
-
-                pred_cam.append(output['theta'][:, :, :3].reshape(batch_size * seqlen, -1))
-                pred_verts.append(output['verts'].reshape(batch_size * seqlen, -1, 3))
-                pred_pose.append(output['theta'][:,:,3:75].reshape(batch_size * seqlen, -1))
-                pred_betas.append(output['theta'][:, :,75:].reshape(batch_size * seqlen, -1))
-                pred_joints3d.append(output['kp_3d'].reshape(batch_size * seqlen, -1, 3))
-                smpl_joints2d.append(output['kp_2d'].reshape(batch_size * seqlen, -1, 2))
-
+                if args.model == "VIBE":
+                    output = model(batch)[-1]
+                    pred_cam.append(output['theta'][:, :, :3].reshape(batch_size * seqlen, -1))
+                    pred_verts.append(output['verts'].reshape(batch_size * seqlen, -1, 3))
+                    pred_pose.append(output['theta'][:,:,3:75].reshape(batch_size * seqlen, -1))
+                    pred_betas.append(output['theta'][:, :,75:].reshape(batch_size * seqlen, -1))
+                    pred_joints3d.append(output['kp_3d'].reshape(batch_size * seqlen, -1, 3))
+                    smpl_joints2d.append(output['kp_2d'].reshape(batch_size * seqlen, -1, 2))
+                elif args.model == "HMR":
+                    output = model.hmr(batch[0])[-1]
+                    pred_cam.append(output['theta'][:, :3].reshape(batch_size * seqlen, -1))
+                    pred_verts.append(output['verts'].reshape(batch_size * seqlen, -1, 3))
+                    pred_pose.append(output['theta'][:,3:75].reshape(batch_size * seqlen, -1))
+                    pred_betas.append(output['theta'][:,75:].reshape(batch_size * seqlen, -1))
+                    pred_joints3d.append(output['kp_3d'].reshape(batch_size * seqlen, -1, 3))
+                    smpl_joints2d.append(output['kp_2d'].reshape(batch_size * seqlen, -1, 2))
 
             pred_cam = torch.cat(pred_cam, dim=0)
             pred_verts = torch.cat(pred_verts, dim=0)
@@ -408,6 +431,12 @@ if __name__ == '__main__':
     parser.add_argument('--smooth_beta', type=float, default=0.7,
                         help='one euro filter beta. '
                              'Increasing the speed coefficient(beta) decreases speed lag.')
+
+    parser.add_argument('--model', type=str, default='VIBE', choices=['VIBE', 'HMR'],
+                        help='model to use')
+
+    parser.add_argument('--bbox_path', type=str,
+                        help='bath to bounding box')
 
     args = parser.parse_args()
 
